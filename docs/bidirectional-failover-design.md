@@ -3,8 +3,10 @@
 **목표:** provider 장애 시 같은 턴을 다른 provider로 자동 재실행한다.
 `codex` 장애 → `claude`, `claude` 장애 → `codex`.
 
-**상태:** 설계 단계 (미구현). 트리거 범위 = **장애만** (턴 타임아웃 제외, §8 참고).
+**상태:** ✅ **구현 완료 (2026-05-31)**. 트리거 범위 = **장애만** (턴 타임아웃 제외, §8 참고).
 **작성:** 2026-05-31. 영감: [phj1081/EJClaw](https://github.com/phj1081/EJClaw)의 단방향 Claude→Codex failover.
+
+> **구현 요약 (설계대로):** 신규 `container/agent-runner/src/providers/failure-classification.ts`(에러→사유 분류) + `providers/failover.ts`(`otherProvider`/`shouldFailover`). `poll-loop.ts`에 `runTurnAttempt`로 턴을 추출하고, 1차 실패가 outage(`shouldFailover`)이며 가시 출력 전(`!sawVisibleOutput`)이면 파트너 provider로 같은 prompt를 **턴당 1회** 재실행. `processQuery`가 `{type:'error'}` 이벤트를 분류·래치(결과 도착 시 해제)하고 `sawVisibleOutput`을 추적. 파트너는 `index.ts`에서 옵션과 함께 미리 생성해 `PollLoopConfig.failoverProvider`로 주입(provider별 continuation 분리라 파트너는 자기 세션 resume). 설정: `config.ts`의 `autoFailover`(container.json, 기본 ON). 테스트: `failure-classification.test.ts`, `failover.test.ts`, `poll-loop.failover.test.ts` — agent-runner 전체 **127 pass**, 타입체크 클린. 컨테이너 src 바인드 마운트라 **이미지 재빌드 불필요**.
 
 ---
 

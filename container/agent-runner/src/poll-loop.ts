@@ -2,7 +2,7 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import { clearContinuation, getContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
   formatMessages,
@@ -14,6 +14,8 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { classifyProviderFailure, type FailureReason } from './providers/failure-classification.js';
+import { shouldFailover } from './providers/failover.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -62,6 +64,15 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Optional failover partner. When the primary provider fails on an outage
+   * (auth/quota/429/overload/network) BEFORE any output reaches the user, the
+   * poll-loop re-runs the same turn on this provider exactly once. Built in
+   * index.ts (where ProviderOptions live) when autoFailover is on and the
+   * primary has a known partner (codex<->claude). Omit to disable failover.
+   */
+  failoverProvider?: AgentProvider;
+  failoverProviderName?: string;
 }
 
 /**
@@ -204,13 +215,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
-
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
@@ -218,33 +222,79 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
-      if (result.continuation && result.continuation !== continuation) {
-        continuation = result.continuation;
+      // Primary attempt.
+      let outcome = await runTurnAttempt(
+        config.provider,
+        config.providerName,
+        prompt,
+        continuation,
+        config.cwd,
+        config.systemContext,
+        routing,
+        processingIds,
+      );
+      // Persist any continuation progress on the primary (success or partial).
+      if (outcome.continuation && outcome.continuation !== continuation) {
+        continuation = outcome.continuation;
         setContinuation(config.providerName, continuation);
       }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
 
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
-        continuation = undefined;
-        clearContinuation(config.providerName);
+      // Bidirectional failover: a provider OUTAGE before any output reached
+      // the user → re-run the same turn on the partner provider, exactly once.
+      // The partner keys its own continuation, so it resumes (or starts) its
+      // own session independently of the primary's.
+      if (
+        outcome.kind === 'failed' &&
+        shouldFailover(outcome.reason) &&
+        !outcome.sawVisibleOutput &&
+        config.failoverProvider &&
+        config.failoverProviderName
+      ) {
+        log(
+          `Failover: ${config.providerName} unavailable (${outcome.reason}) — handing turn to ${config.failoverProviderName}`,
+        );
+        const altContinuation = getContinuation(config.failoverProviderName);
+        const altOutcome = await runTurnAttempt(
+          config.failoverProvider,
+          config.failoverProviderName,
+          prompt,
+          altContinuation,
+          config.cwd,
+          config.systemContext,
+          routing,
+          processingIds,
+        );
+        if (altOutcome.continuation && altOutcome.continuation !== altContinuation) {
+          setContinuation(config.failoverProviderName, altOutcome.continuation);
+        }
+        if (altOutcome.kind === 'ok') {
+          log(`Failover succeeded — ${config.failoverProviderName} served the turn`);
+          outcome = altOutcome;
+        } else {
+          // Partner failed too — keep the primary failure for user-facing
+          // reporting (its reason is the root cause).
+          log(`Failover partner ${config.failoverProviderName} also failed (${altOutcome.reason})`);
+        }
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Still failed after any failover → recover a stale session and surface
+      // the error so the user knows something went wrong.
+      if (outcome.kind === 'failed') {
+        log(`Query error: ${outcome.errorText}`);
+        if (continuation && outcome.err && config.provider.isSessionInvalid(outcome.err)) {
+          log(`Stale session detected (${continuation}) — clearing for next retry`);
+          continuation = undefined;
+          clearContinuation(config.providerName);
+        }
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${outcome.errorText}` }),
+        });
+      }
     } finally {
       clearCurrentInReplyTo();
     }
@@ -292,6 +342,70 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  /**
+   * Set when the turn ended on a provider-outage `{type:'error'}` event with
+   * no recovering `result` afterward. 'none' (or undefined) means the turn
+   * either succeeded or failed in a non-failover-worthy way.
+   */
+  failureReason?: FailureReason;
+  /** Raw error text behind failureReason, for logging / user surfacing. */
+  failureText?: string;
+}
+
+/** Outcome of running one turn against one provider. */
+type AttemptOutcome =
+  | { kind: 'ok'; continuation?: string }
+  | {
+      kind: 'failed';
+      reason: FailureReason;
+      sawVisibleOutput: boolean;
+      continuation?: string;
+      errorText: string;
+      /** Present only when the failure came from a thrown exception. */
+      err?: unknown;
+    };
+
+/**
+ * Run one turn against one provider and normalize both failure channels
+ * (a `{type:'error'}` outage event and a thrown exception) into a single
+ * AttemptOutcome. `sawVisibleOutput` reflects whether anything was dispatched
+ * to the user before the failure — the poll-loop's guard against failing over
+ * (and re-answering) after the user already saw output.
+ */
+export async function runTurnAttempt(
+  provider: AgentProvider,
+  providerName: string,
+  prompt: string,
+  contn: string | undefined,
+  cwd: string,
+  systemContext: PollLoopConfig['systemContext'],
+  routing: RoutingContext,
+  processingIds: string[],
+): Promise<AttemptOutcome> {
+  const state = { sawVisibleOutput: false };
+  const query = provider.query({ prompt, continuation: contn, cwd, systemContext });
+  try {
+    const result = await processQuery(query, routing, processingIds, providerName, state);
+    if (result.failureReason && result.failureReason !== 'none') {
+      return {
+        kind: 'failed',
+        reason: result.failureReason,
+        sawVisibleOutput: state.sawVisibleOutput,
+        continuation: result.continuation,
+        errorText: result.failureText ?? result.failureReason,
+      };
+    }
+    return { kind: 'ok', continuation: result.continuation };
+  } catch (err) {
+    const errorText = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'failed',
+      reason: classifyProviderFailure({ errorText }),
+      sawVisibleOutput: state.sawVisibleOutput,
+      errorText,
+      err,
+    };
+  }
 }
 
 async function processQuery(
@@ -299,10 +413,15 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  state: { sawVisibleOutput: boolean } = { sawVisibleOutput: false },
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Latched on a provider-outage `error` event; cleared if a `result` arrives
+  // afterward (the SDK recovered). Drives bidirectional failover in the caller.
+  let failureReason: FailureReason | undefined;
+  let failureText: string | undefined;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -432,6 +551,20 @@ async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'error') {
+        // Classify provider failures (claude rate_limit_event, codex
+        // turn/failed). Latch the reason so the caller can fail over; a
+        // later `result` clears it (the SDK recovered). retryable events
+        // (claude api_retry) classify to 'none' and are ignored here.
+        const reason = classifyProviderFailure({
+          errorText: event.message,
+          classification: event.classification,
+          retryable: event.retryable,
+        });
+        if (reason !== 'none') {
+          failureReason = reason;
+          failureText = event.message;
+        }
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -440,8 +573,13 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        // A result means the turn completed; any earlier transient error
+        // was recovered, so drop the latched failover reason.
+        failureReason = undefined;
+        failureText = undefined;
         if (event.text) {
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing);
+          if (sent > 0) state.sawVisibleOutput = true;
           if (hasUnwrapped && !unwrappedNudged) {
             unwrappedNudged = true;
             const destinations = getAllDestinations();
@@ -461,7 +599,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, failureReason, failureText };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {

@@ -18,6 +18,13 @@ export interface RunnerConfig {
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
   model?: string;
   effort?: string;
+  /**
+   * Auto-failover to the partner provider (codex<->claude) when the primary
+   * fails on an outage before any output reaches the user. Defaults ON; set
+   * `"autoFailover": false` in container.json to disable. Only has an effect
+   * when the primary has a registered partner.
+   */
+  autoFailover: boolean;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -47,6 +54,8 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    // Default ON — only `false` disables it.
+    autoFailover: raw.autoFailover !== false,
   };
 
   return _config;

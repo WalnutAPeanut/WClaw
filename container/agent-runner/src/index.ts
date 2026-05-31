@@ -31,6 +31,8 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { otherProvider } from './providers/failover.js';
+import type { AgentProvider } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -86,20 +88,43 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
-  const provider = createProvider(providerName, {
+  const providerOptions = {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,
-  });
+  };
+
+  const provider = createProvider(providerName, providerOptions);
+
+  // Bidirectional failover: build the partner provider (codex<->claude) up
+  // front so the poll-loop can hand a failing turn to it. Constructing a
+  // provider is cheap (no process spawns until query()); the partner only
+  // does work if the primary actually fails. Disabled when autoFailover is
+  // off, the primary has no partner, or the partner can't be constructed
+  // (e.g. its CLI isn't installed in this image).
+  let failoverProvider: AgentProvider | undefined;
+  let failoverProviderName: string | undefined;
+  const partnerName = config.autoFailover ? otherProvider(providerName) : null;
+  if (partnerName) {
+    try {
+      failoverProvider = createProvider(partnerName, providerOptions);
+      failoverProviderName = partnerName;
+      log(`Auto-failover enabled: ${providerName} <-> ${partnerName}`);
+    } catch (err) {
+      log(`Auto-failover partner "${partnerName}" unavailable, disabling: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   await runPollLoop({
     provider,
     providerName,
     cwd: CWD,
     systemContext: { instructions },
+    failoverProvider,
+    failoverProviderName,
   });
 }
 
