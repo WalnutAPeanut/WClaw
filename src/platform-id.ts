@@ -23,3 +23,36 @@ export function namespacedPlatformId(channel: string, raw: string): string {
   if (channel === 'deltachat') return raw;
   return `${channel}:${raw}`;
 }
+
+/**
+ * Validate that a platform_id is structurally well-formed for its channel,
+ * throwing an actionable error if not. Run this at the boundaries where an
+ * operator hand-supplies a platform_id (e.g. init-first-agent) so a typo
+ * fails loudly at wiring time instead of silently 404-ing on every send.
+ *
+ * Currently enforces Discord's `discord:<guildId>:<channelId>` shape, where
+ * guildId is `@me` (DM / group DM) or a numeric snowflake and channelId is a
+ * numeric snowflake. This catches the common mistake of passing a *user* id
+ * as the DM target (e.g. `discord:dm:<userId>`), which Discord rejects with
+ * "Unknown Channel" (10003) — a DM channel id must come from
+ * `POST /users/@me/channels`, it is NOT the user's id. Channels not listed
+ * here pass through unchecked: native adapters use their own id formats and
+ * this validator only knows the ones it lists.
+ */
+export function assertValidPlatformId(channel: string, platformId: string): void {
+  if (channel === 'discord') {
+    const parts = platformId.split(':');
+    const wellFormed =
+      parts.length === 3 &&
+      parts[0] === 'discord' &&
+      (parts[1] === '@me' || /^\d+$/.test(parts[1])) &&
+      /^\d+$/.test(parts[2]);
+    if (!wellFormed) {
+      throw new Error(
+        `Malformed Discord platform_id "${platformId}". Expected "discord:@me:<dmChannelId>" for a DM ` +
+          `or "discord:<guildId>:<channelId>" for a guild channel, where the ids are numeric snowflakes. ` +
+          `A DM channel id comes from POST /users/@me/channels — it is not your user id.`,
+      );
+    }
+  }
+}

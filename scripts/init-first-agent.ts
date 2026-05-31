@@ -49,7 +49,7 @@ import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-role
 import { upsertUser } from '../src/modules/permissions/db/users.js';
 import { updateContainerConfigScalars } from '../src/db/container-configs.js';
 import { initGroupFilesystem } from '../src/group-init.js';
-import { namespacedPlatformId } from '../src/platform-id.js';
+import { assertValidPlatformId, namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
 
 type Role = 'owner' | 'admin' | 'member';
@@ -262,6 +262,9 @@ async function main(): Promise<void> {
 
   // 3. DM messaging group.
   const platformId = namespacedPlatformId(args.channel, args.platformId);
+  // Fail loudly on a malformed hand-supplied id (e.g. `discord:dm:<userId>`)
+  // rather than wiring an agent that 404s ("Unknown Channel") on every send.
+  assertValidPlatformId(args.channel, platformId);
   let dmMg = getMessagingGroupByPlatform(args.channel, platformId);
   if (!dmMg) {
     const mgId = generateId('mg');

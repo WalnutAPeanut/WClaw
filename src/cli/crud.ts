@@ -69,6 +69,14 @@ export interface ResourceDef {
   };
   /** Non-standard verbs (grant, revoke, add, remove, restart, etc.). */
   customOperations?: Record<string, CustomOperation>;
+  /**
+   * Optional invariant check run on the assembled row (after defaults) just
+   * before INSERT in `create`. Throw to reject the row. Use for cross-column
+   * or format validation the per-column `enum` check can't express — e.g.
+   * a Discord platform_id must be `discord:<guildId>:<channelId>` encoded,
+   * not a bare channel snowflake that would be undeliverable.
+   */
+  validate?: (values: Record<string, unknown>) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +160,8 @@ function genericCreate(def: ResourceDef) {
         values[col.name] = col.default;
       }
     }
+
+    def.validate?.(values);
 
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);

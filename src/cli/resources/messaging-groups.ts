@@ -1,9 +1,15 @@
+import { assertValidPlatformId } from '../../platform-id.js';
 import { registerResource } from '../crud.js';
 
 registerResource({
   name: 'messaging-group',
   plural: 'messaging-groups',
   table: 'messaging_groups',
+  // Reject a malformed platform_id at create time (e.g. a bare Discord channel
+  // snowflake instead of the "discord:<guildId>:<channelId>" encoding). Stored
+  // unvalidated, such a row is undeliverable — the adapter's decodeThreadId
+  // throws on every send so the channel silently never receives anything.
+  validate: (v) => assertValidPlatformId(String(v.channel_type), String(v.platform_id)),
   description:
     'Messaging group — one chat or channel on one platform (a Telegram DM, a Discord channel, a Slack thread root, an email address). Identity is the (channel_type, platform_id) pair, which must be unique.',
   idColumn: 'id',
